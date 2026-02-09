@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "mcp__jira-ticket-analyzer__save_to_file",
+      "mcp__jira-ticket-analyzer__search_jira_issues",
+      "mcp__jira-ticket-analyzer__get_jira_issue",
+      "Bash(python:*)"
+    ]
+  },
+  "mcpServers": {
+    "jira-ticket-analyzer": {
+      "command": "python",
+      "args": [
+        "C:/workarea/content_creator/src/jira_mcp_server.py"
+      ]
+    }
+  }
+}
