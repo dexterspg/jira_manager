@@ -4,10 +4,13 @@
 
 When the user says **"Analyze ticket PROJ-1234"** (or any variation like "look at", "review", "check"):
 
-1. Delegate to the **ticket-analyzer** agent to fetch full ticket data and gather raw findings
-2. Pass the raw data to the **content-creator** agent, which reads `templates/content-creator-five-questions.md` and produces the final 5-question analysis
-3. The content-creator saves the result to `output/{TICKET-KEY}-analysis.md` using `save_to_file`
-4. Display the analysis to the user
+1. Delegate directly to the **content-creator** agent — it fetches ticket data and produces the 5-question analysis in a single pass
+2. The content-creator saves the result to `output/{TICKET-KEY}-analysis.md` using `save_to_file`
+3. Display the analysis to the user
+
+When the user asks for **general ticket info** (not a 5-question analysis):
+
+1. Delegate to the **ticket-analyzer** agent for raw ticket data and findings
 
 When the user says **"Search for..."** or asks about tickets:
 
@@ -15,38 +18,48 @@ When the user says **"Search for..."** or asks about tickets:
 2. Call `search_jira_issues` with the JQL query
 3. Summarize the results
 
+When the user wants to **create, copy, or manage tickets**:
+
+1. Delegate to the **ticket-manager** agent
+
 ## Available MCP Tools
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `get_jira_issue` | Fetch one ticket's full details | `get_jira_issue("LAE-123")` |
+| `get_jira_issue` | Fetch one ticket's full details (all comments, linked issues, attachments) | `get_jira_issue("LAE-123")` |
 | `search_jira_issues` | Search with JQL | `search_jira_issues("project = LAE AND status = Open")` |
+| `create_jira_issue` | Create a new ticket | `create_jira_issue("LAE", "Fix login bug", "Bug")` |
+| `copy_jira_issue` | Clone an existing ticket | `copy_jira_issue("LAE-123", target_project_key="OTHER")` |
 | `save_to_file` | Save content to `output/` | `save_to_file("LAE-123-analysis.md", content)` |
 
 ## Project Structure
 
 ```
 src/jira_mcp_server.py       — MCP server (Jira REST API tools + file saving)
-templates/content-creator-five-questions.md  — 5-question analysis template (owned by content-creator)
+templates/                    — Reference templates (content-creator has template embedded)
 output/                       — Generated analyses and content
 .claude/agents/               — Specialized subagents
 ```
 
 ## Subagents
 
-### Analysis Workflow (ticket-analyzer → content-creator)
+### Analysis & Content
 
-- **ticket-analyzer** (blue) — Fetches and analyzes raw ticket data. Responds to whatever it's asked — does not own the template or produce final documents. Used by the content-creator to gather data for the 5 questions.
-- **content-creator** (purple) — Owns the 5-question template. Communicates the questions to ticket-analyzer, takes the raw data back, and produces the final detailed analysis document. Also generates KB articles, release notes, and other content formats.
+- **content-creator** (purple) — Self-sufficient: fetches ticket data via `get_jira_issue` and produces the final 5-question analysis in one pass. Also generates KB articles, release notes, and other content formats.
+- **ticket-analyzer** (blue) — General-purpose ticket data gathering and analysis. Use when the user needs raw ticket info, patterns across tickets, or ad-hoc investigation (not the 5-question analysis).
 
-### Utility Agents
+### Operations
+
+- **ticket-manager** (green) — Creates, copies, and manages Jira tickets using `create_jira_issue` and `copy_jira_issue`.
+
+### Utility
 
 - **jql-query-builder** (yellow) — Complex JQL query construction and iterative search refinement
 - **jira-api-developer** (green) — Maintain and extend the MCP server
 
 ## Analysis Format
 
-Every ticket analysis follows the 5-question format from `templates/content-creator-five-questions.md`:
+Every ticket analysis follows the 5-question format (template embedded in content-creator agent):
 1. What was the issue and its impact?
 2. What caused the issue?
 3. What troubleshooting steps should be taken?

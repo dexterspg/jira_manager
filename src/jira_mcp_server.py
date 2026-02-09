@@ -44,6 +44,14 @@ def _jira_get(endpoint: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+def _jira_post(endpoint: str, json_data: dict) -> dict:
+    """Make an authenticated POST request to Jira REST API."""
+    url = f"{JIRA_BASE_URL}/rest/api/3/{endpoint}"
+    resp = requests.post(url, headers=_jira_headers(), json=json_data, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------- Tools ----------
 
 
@@ -60,11 +68,16 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
 
     max_results = min(max_results, 50)
     try:
-        data = _jira_get("search", params={
+        # Use the new /rest/api/3/search/jql endpoint with POST
+        url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
+        payload = {
             "jql": jql,
             "maxResults": max_results,
-            "fields": "summary,status,priority,assignee,reporter,updated,issuetype,project",
-        })
+            "fields": ["summary", "status", "priority", "assignee", "reporter", "updated", "issuetype", "project"],
+        }
+        resp = requests.post(url, headers=_jira_headers(), json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
     except requests.RequestException as e:
@@ -110,7 +123,7 @@ def get_jira_issue(issue_key: str) -> str:
 
     try:
         data = _jira_get(f"issue/{issue_key}", params={
-            "fields": "summary,description,status,priority,assignee,reporter,created,updated,issuetype,project,labels,components,fixVersions,comment",
+            "fields": "summary,description,status,priority,assignee,reporter,created,updated,issuetype,project,labels,components,fixVersions,comment,resolution,resolutiondate,issuelinks,attachment",
         })
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
@@ -123,6 +136,7 @@ def get_jira_issue(issue_key: str) -> str:
     assignee = fields.get("assignee")
     reporter = fields.get("reporter")
     desc = fields.get("description")
+    resolution = fields.get("resolution")
 
     # Convert Atlassian Document Format to plain text
     desc_text = _adf_to_text(desc) if desc else "No description"
@@ -133,6 +147,8 @@ def get_jira_issue(issue_key: str) -> str:
         f"**Type:** {fields.get('issuetype', {}).get('name', '')}",
         f"**Status:** {fields.get('status', {}).get('name', '')}",
         f"**Priority:** {fields.get('priority', {}).get('name', '')}",
+        f"**Resolution:** {resolution.get('name', 'Unresolved') if resolution else 'Unresolved'}",
+        f"**Resolution Date:** {fields.get('resolutiondate', 'N/A') or 'N/A'}",
         f"**Project:** {fields.get('project', {}).get('name', '')} ({fields.get('project', {}).get('key', '')})",
         f"**Assignee:** {assignee.get('displayName', 'Unassigned') if assignee else 'Unassigned'}",
         f"**Reporter:** {reporter.get('displayName', 'Unknown') if reporter else 'Unknown'}",
@@ -154,15 +170,47 @@ def get_jira_issue(issue_key: str) -> str:
 
     lines.append(f"\n## Description\n{desc_text}")
 
-    # Include recent comments
+    # Include ALL comments
     comments_data = fields.get("comment", {}).get("comments", [])
     if comments_data:
-        lines.append(f"\n## Comments ({len(comments_data)})")
-        for c in comments_data[-5:]:  # Last 5 comments
+        lines.append(f"\n## Comments ({len(comments_data)} total)")
+        for c in comments_data:
             author = c.get("author", {}).get("displayName", "Unknown")
-            created = c.get("created", "")[:10]
+            created = c.get("created", "")[:16]
             body = _adf_to_text(c.get("body")) if c.get("body") else ""
             lines.append(f"\n**{author}** ({created}):\n{body}")
+
+    # Include linked issues with summary details
+    issue_links = fields.get("issuelinks", [])
+    if issue_links:
+        lines.append(f"\n## Linked Issues ({len(issue_links)})")
+        for link in issue_links:
+            link_type = link.get("type", {}).get("name", "Related")
+            if "outwardIssue" in link:
+                linked = link["outwardIssue"]
+                direction = link.get("type", {}).get("outward", "relates to")
+            elif "inwardIssue" in link:
+                linked = link["inwardIssue"]
+                direction = link.get("type", {}).get("inward", "relates to")
+            else:
+                continue
+            linked_key = linked.get("key", "")
+            linked_summary = linked.get("fields", {}).get("summary", "")
+            linked_status = linked.get("fields", {}).get("status", {}).get("name", "")
+            linked_type = linked.get("fields", {}).get("issuetype", {}).get("name", "")
+            lines.append(f"- **{linked_key}** ({linked_type} | {linked_status}) — {direction}")
+            lines.append(f"  {linked_summary}")
+
+    # Include attachments
+    attachments = fields.get("attachment", [])
+    if attachments:
+        lines.append(f"\n## Attachments ({len(attachments)})")
+        for att in attachments:
+            att_name = att.get("filename", "unknown")
+            att_size = att.get("size", 0)
+            att_author = att.get("author", {}).get("displayName", "Unknown")
+            att_created = att.get("created", "")[:10]
+            lines.append(f"- **{att_name}** ({att_size} bytes) — uploaded by {att_author} on {att_created}")
 
     return "\n".join(lines)
 
@@ -203,6 +251,139 @@ def _adf_to_text(node: dict | list | None) -> str:
         return f"```\n{code}```\n"
 
     return _adf_to_text(content)
+
+
+@mcp.tool()
+def create_jira_issue(
+    project_key: str,
+    summary: str,
+    issue_type: str = "Task",
+    description: str = "",
+    priority: str = "",
+    assignee_id: str = "",
+    labels: list[str] | None = None,
+) -> str:
+    """Create a new Jira issue.
+
+    Args:
+        project_key: The project key (e.g. 'LAE')
+        summary: Issue summary/title
+        issue_type: Issue type name (e.g. 'Task', 'Bug', 'Story'). Default 'Task'
+        description: Plain text description (converted to Atlassian Document Format)
+        priority: Priority name (e.g. 'High', 'Medium', 'Low'). Leave empty for project default
+        assignee_id: Atlassian account ID of the assignee. Leave empty for unassigned
+        labels: List of label strings to apply
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
+    fields: dict = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "issuetype": {"name": issue_type},
+    }
+
+    if description:
+        fields["description"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
+        }
+
+    if priority:
+        fields["priority"] = {"name": priority}
+    if assignee_id:
+        fields["assignee"] = {"accountId": assignee_id}
+    if labels:
+        fields["labels"] = labels
+
+    try:
+        data = _jira_post("issue", {"fields": fields})
+    except requests.HTTPError as e:
+        return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    new_key = data.get("key", "")
+    return f"Issue created: **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
+
+
+@mcp.tool()
+def copy_jira_issue(
+    source_issue_key: str,
+    target_project_key: str = "",
+    summary_override: str = "",
+    description_override: str = "",
+    issue_type_override: str = "",
+) -> str:
+    """Copy (clone) an existing Jira issue into a new issue.
+
+    Fetches the source issue and creates a new issue with the same fields.
+    Optionally override the target project, summary, description, or issue type.
+
+    Args:
+        source_issue_key: The issue key to copy from (e.g. 'LAE-123')
+        target_project_key: Target project key. Leave empty to use same project as source
+        summary_override: Override the summary. Leave empty to copy original (prefixed with '[Copy] ')
+        description_override: Override the description. Leave empty to copy original
+        issue_type_override: Override the issue type. Leave empty to copy original
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
+    # Fetch source issue
+    try:
+        source = _jira_get(f"issue/{source_issue_key}", params={
+            "fields": "summary,description,issuetype,project,priority,labels,components",
+        })
+    except requests.HTTPError as e:
+        return f"Error fetching source issue: {e.response.status_code} — {e.response.text[:500]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    src_fields = source.get("fields", {})
+
+    project_key = target_project_key or src_fields.get("project", {}).get("key", "")
+    summary = summary_override or f"[Copy] {src_fields.get('summary', '')}"
+    issue_type = issue_type_override or src_fields.get("issuetype", {}).get("name", "Task")
+
+    fields: dict = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "issuetype": {"name": issue_type},
+    }
+
+    # Copy description (already in ADF) or use override
+    if description_override:
+        fields["description"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": description_override}]}],
+        }
+    elif src_fields.get("description"):
+        fields["description"] = src_fields["description"]
+
+    priority = src_fields.get("priority")
+    if priority:
+        fields["priority"] = {"name": priority.get("name", "")}
+
+    labels = src_fields.get("labels", [])
+    if labels:
+        fields["labels"] = labels
+
+    components = src_fields.get("components", [])
+    if components:
+        fields["components"] = [{"name": c.get("name", "")} for c in components]
+
+    try:
+        data = _jira_post("issue", {"fields": fields})
+    except requests.HTTPError as e:
+        return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    new_key = data.get("key", "")
+    return f"Issue copied: **{source_issue_key}** → **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
 
 
 @mcp.tool()
