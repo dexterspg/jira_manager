@@ -61,12 +61,12 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
 
     Args:
         jql: A JQL query string (e.g. 'project = LAE AND assignee = currentUser()')
-        max_results: Maximum number of results to return (default 20, max 50)
+        max_results: Maximum number of results to return (default 20, max 100)
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
 
-    max_results = min(max_results, 50)
+    max_results = min(max_results, 100)
     try:
         # Use the new /rest/api/3/search/jql endpoint with POST
         url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
@@ -95,7 +95,8 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
         fields = issue["fields"]
         summary = fields.get("summary", "")
         status = fields.get("status", {}).get("name", "Unknown")
-        priority = fields.get("priority", {}).get("name", "None")
+        priority_obj = fields.get("priority")
+        priority = priority_obj.get("name", "None") if priority_obj else "None"
         issue_type = fields.get("issuetype", {}).get("name", "")
         assignee = fields.get("assignee", {})
         assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
@@ -387,18 +388,25 @@ def copy_jira_issue(
 
 
 @mcp.tool()
-def save_to_file(filename: str, content: str) -> str:
+def save_to_file(filename: str, content: str, output_dir: str = "") -> str:
     """Save content to a file in the output/ directory.
 
     Args:
         filename: Name of the file to save (e.g. 'PROJ-123-analysis.md')
         content: The content to write to the file
+        output_dir: Optional directory to save to. If omitted, saves to the default output/ directory.
     """
     safe_name = "".join(c for c in filename if c.isalnum() or c in ".-_")
     if not safe_name:
         return "Error: Invalid filename"
 
-    filepath = OUTPUT_DIR / safe_name
+    if output_dir:
+        target_dir = Path(output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        target_dir = OUTPUT_DIR
+
+    filepath = target_dir / safe_name
     filepath.write_text(content, encoding="utf-8")
     return f"File saved successfully: {filepath}"
 
