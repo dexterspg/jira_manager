@@ -266,6 +266,7 @@ def create_jira_issue(
     priority: str = "",
     assignee_id: str = "",
     labels: list[str] | None = None,
+    custom_fields: dict | None = None,
 ) -> str:
     """Create a new Jira issue.
 
@@ -277,6 +278,7 @@ def create_jira_issue(
         priority: Priority name (e.g. 'High', 'Medium', 'Low'). Leave empty for project default
         assignee_id: Atlassian account ID of the assignee. Leave empty for unassigned
         labels: List of label strings to apply
+        custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Values are passed directly to the Jira API.
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
@@ -300,6 +302,8 @@ def create_jira_issue(
         fields["assignee"] = {"accountId": assignee_id}
     if labels:
         fields["labels"] = labels
+    if custom_fields:
+        fields.update(custom_fields)
 
     try:
         data = _jira_post("issue", {"fields": fields})
@@ -319,11 +323,13 @@ def copy_jira_issue(
     summary_override: str = "",
     description_override: str = "",
     issue_type_override: str = "",
+    custom_fields: dict | None = None,
 ) -> str:
     """Copy (clone) an existing Jira issue into a new issue.
 
     Fetches the source issue and creates a new issue with the same fields.
     Optionally override the target project, summary, description, or issue type.
+    Custom fields from the source are automatically carried over. Use custom_fields to override or add additional custom fields.
 
     Args:
         source_issue_key: The issue key to copy from (e.g. 'LAE-123')
@@ -331,15 +337,14 @@ def copy_jira_issue(
         summary_override: Override the summary. Leave empty to copy original (prefixed with '[Copy] ')
         description_override: Override the description. Leave empty to copy original
         issue_type_override: Override the issue type. Leave empty to copy original
+        custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Overrides source custom fields if same key. Values are passed directly to the Jira API.
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
 
-    # Fetch source issue
+    # Fetch source issue (include all fields to capture custom fields)
     try:
-        source = _jira_get(f"issue/{source_issue_key}", params={
-            "fields": "summary,description,issuetype,project,priority,labels,components",
-        })
+        source = _jira_get(f"issue/{source_issue_key}")
     except requests.HTTPError as e:
         return f"Error fetching source issue: {e.response.status_code} — {e.response.text[:500]}"
     except requests.RequestException as e:
@@ -379,15 +384,96 @@ def copy_jira_issue(
     if components:
         fields["components"] = [{"name": c.get("name", "")} for c in components]
 
+    fix_versions = src_fields.get("fixVersions", [])
+    if fix_versions:
+        fields["fixVersions"] = [{"name": v.get("name", "")} for v in fix_versions]
+
+    # Carry over custom fields from source (customfield_XXXXX)
+    # Skip fields that are read-only or cause errors during creation
+    _SKIP_CUSTOM_FIELDS = {
+        "customfield_10007",  # Rank (Lexorank — causes rankBeforeIssue/rankAfterIssue errors)
+        "customfield_10019",  # Rank (alternate ID in some Jira instances)
+        "customfield_10016",  # Sprint (managed by board)
+    }
+    for key, value in src_fields.items():
+        if not key.startswith("customfield_") or value is None:
+            continue
+        if key in _SKIP_CUSTOM_FIELDS:
+            continue
+        # Skip complex objects that are likely read-only (e.g., requestType, SLA)
+        if isinstance(value, dict) and "requestType" in str(value):
+            continue
+        fields[key] = value
+
+    # Apply custom field overrides (these take priority over source values)
+    if custom_fields:
+        fields.update(custom_fields)
+
+    # Attempt creation — if it fails due to invalid fields, strip them and retry
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            data = _jira_post("issue", {"fields": fields})
+            break
+        except requests.HTTPError as e:
+            if e.response.status_code == 400 and attempt < max_retries - 1:
+                try:
+                    err = e.response.json()
+                    bad_fields = list(err.get("errors", {}).keys())
+                    if bad_fields:
+                        for bf in bad_fields:
+                            # Remove by error key (e.g. "rankBeforeIssue")
+                            fields.pop(bf, None)
+                            # Also remove any customfield_ that might map to this error
+                            to_remove = [k for k in fields if k.startswith("customfield_") and bf.lower() in str(fields[k]).lower()]
+                            for k in to_remove:
+                                fields.pop(k, None)
+                        logger.info(f"Copy retry {attempt + 1}: removed fields {bad_fields}")
+                        continue
+                except (ValueError, KeyError):
+                    pass
+            return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
+        except requests.RequestException as e:
+            return f"Connection error: {e}"
+
+    new_key = data.get("key", "")
+    return f"Issue copied: **{source_issue_key}** → **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
+
+
+@mcp.tool()
+def get_custom_fields(search: str = "") -> str:
+    """List available Jira custom fields and their IDs.
+
+    Args:
+        search: Optional search string to filter fields by name (case-insensitive). Leave empty to list all custom fields.
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
     try:
-        data = _jira_post("issue", {"fields": fields})
+        url = f"{JIRA_BASE_URL}/rest/api/3/field"
+        resp = requests.get(url, headers=_jira_headers(), timeout=30)
+        resp.raise_for_status()
+        all_fields = resp.json()
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
     except requests.RequestException as e:
         return f"Connection error: {e}"
 
-    new_key = data.get("key", "")
-    return f"Issue copied: **{source_issue_key}** → **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
+    custom = [f for f in all_fields if f.get("custom", False)]
+    if search:
+        search_lower = search.lower()
+        custom = [f for f in custom if search_lower in f.get("name", "").lower()]
+
+    if not custom:
+        return f"No custom fields found matching '{search}'" if search else "No custom fields found"
+
+    custom.sort(key=lambda f: f.get("name", ""))
+    lines = [f"Found {len(custom)} custom field(s):\n"]
+    for f in custom:
+        lines.append(f"- **{f.get('name', '')}** — `{f.get('id', '')}` (type: {f.get('schema', {}).get('type', 'unknown')})")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()

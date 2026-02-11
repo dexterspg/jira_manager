@@ -4,5 +4,9 @@
       "Bash(dir:*)",
       "Bash(python:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "jira"
+  ],
+  "enableAllProjectMcpServers": true
 }
