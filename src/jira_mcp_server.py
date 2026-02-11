@@ -231,6 +231,9 @@ def _adf_to_text(node: dict | list | None) -> str:
     text = node.get("text", "")
     content = node.get("content", [])
 
+    if node_type == "mention":
+        attrs = node.get("attrs", {})
+        return attrs.get("text", "")
     if text:
         return text
     if node_type == "hardBreak":
