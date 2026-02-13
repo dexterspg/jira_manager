@@ -52,6 +52,13 @@ def _jira_post(endpoint: str, json_data: dict) -> dict:
     return resp.json()
 
 
+def _jira_put(endpoint: str, json_data: dict) -> None:
+    """Make an authenticated PUT request to Jira REST API."""
+    url = f"{JIRA_BASE_URL}/rest/api/3/{endpoint}"
+    resp = requests.put(url, headers=_jira_headers(), json=json_data, timeout=30)
+    resp.raise_for_status()
+
+
 # ---------- Tools ----------
 
 
@@ -314,6 +321,110 @@ def create_jira_issue(
 
     new_key = data.get("key", "")
     return f"Issue created: **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
+
+
+@mcp.tool()
+def update_jira_issue(
+    issue_key: str,
+    summary: str = "",
+    description: str = "",
+    status: str = "",
+    priority: str = "",
+    assignee_id: str = "",
+    labels: list[str] | None = None,
+    comment: str = "",
+    custom_fields: dict | None = None,
+) -> str:
+    """Update an existing Jira issue's fields.
+
+    Only provided fields are updated — omitted fields are left unchanged.
+    To clear a field, pass an explicit empty/null value in custom_fields.
+
+    Args:
+        issue_key: The issue key to update (e.g. 'LAE-123')
+        summary: New summary/title. Leave empty to keep current
+        description: New plain text description (converted to ADF). Leave empty to keep current
+        status: Target status name to transition to (e.g. 'In Progress', 'Done'). Leave empty to keep current
+        priority: New priority name (e.g. 'High', 'Medium', 'Low'). Leave empty to keep current
+        assignee_id: Atlassian account ID. Leave empty to keep current
+        labels: New list of labels (replaces all existing labels). Leave as None to keep current
+        comment: Add a comment to the issue. Leave empty to skip
+        custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Values are passed directly to the Jira API.
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
+    results = []
+
+    # Build fields payload
+    fields: dict = {}
+    if summary:
+        fields["summary"] = summary
+    if description:
+        fields["description"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
+        }
+    if priority:
+        fields["priority"] = {"name": priority}
+    if assignee_id:
+        fields["assignee"] = {"accountId": assignee_id}
+    if labels is not None:
+        fields["labels"] = labels
+    if custom_fields:
+        fields.update(custom_fields)
+
+    # Update fields via PUT
+    if fields:
+        try:
+            _jira_put(f"issue/{issue_key}", {"fields": fields})
+            results.append(f"Fields updated: {', '.join(fields.keys())}")
+        except requests.HTTPError as e:
+            return f"Jira API error updating fields: {e.response.status_code} — {e.response.text[:500]}"
+        except requests.RequestException as e:
+            return f"Connection error: {e}"
+
+    # Transition status if requested
+    if status:
+        try:
+            transitions = _jira_get(f"issue/{issue_key}/transitions")
+            match = next(
+                (t for t in transitions.get("transitions", []) if t["name"].lower() == status.lower()),
+                None,
+            )
+            if match:
+                _jira_post(f"issue/{issue_key}/transitions", {"transition": {"id": match["id"]}})
+                results.append(f"Status transitioned to: {status}")
+            else:
+                available = [t["name"] for t in transitions.get("transitions", [])]
+                results.append(f"Status '{status}' not available. Available transitions: {', '.join(available)}")
+        except requests.HTTPError as e:
+            results.append(f"Error transitioning status: {e.response.status_code} — {e.response.text[:500]}")
+        except requests.RequestException as e:
+            results.append(f"Connection error during transition: {e}")
+
+    # Add comment if requested
+    if comment:
+        try:
+            comment_body = {
+                "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+                }
+            }
+            _jira_post(f"issue/{issue_key}/comment", comment_body)
+            results.append("Comment added")
+        except requests.HTTPError as e:
+            results.append(f"Error adding comment: {e.response.status_code} — {e.response.text[:500]}")
+        except requests.RequestException as e:
+            results.append(f"Connection error adding comment: {e}")
+
+    if not results:
+        return f"No changes specified for {issue_key}."
+
+    return f"**{issue_key}** updated — {JIRA_BASE_URL}/browse/{issue_key}\n" + "\n".join(f"- {r}" for r in results)
 
 
 @mcp.tool()

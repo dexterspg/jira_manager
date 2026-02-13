@@ -18,7 +18,7 @@ When the user says **"Search for..."** or asks about tickets:
 2. Call `search_jira_issues` with the JQL query
 3. Summarize the results
 
-When the user wants to **create, copy, or manage tickets**:
+When the user wants to **create, copy, update, or manage tickets**:
 
 1. Delegate to the **ticket-manager** agent
 
@@ -29,6 +29,7 @@ When the user wants to **create, copy, or manage tickets**:
 | `get_jira_issue` | Fetch one ticket's full details (all comments, linked issues, attachments) | `get_jira_issue("LAE-123")` |
 | `search_jira_issues` | Search with JQL | `search_jira_issues("project = LAE AND status = Open")` |
 | `create_jira_issue` | Create a new ticket | `create_jira_issue("LAE", "Fix login bug", "Bug")` |
+| `update_jira_issue` | Update fields, transition status, or add comments on an existing ticket | `update_jira_issue("LAE-123", priority="High", custom_fields={"customfield_10100": "value"})` |
 | `copy_jira_issue` | Clone an existing ticket | `copy_jira_issue("LAE-123", target_project_key="OTHER")` |
 | `save_to_file` | Save content to `output/` | `save_to_file("LAE-123-analysis.md", content)` |
 
@@ -50,7 +51,7 @@ output/                       — Generated analyses and content
 
 ### Operations
 
-- **ticket-manager** (green) — Creates, copies, and manages Jira tickets using `create_jira_issue` and `copy_jira_issue`.
+- **ticket-manager** (green) — Creates, copies, updates, and manages Jira tickets using `create_jira_issue`, `update_jira_issue`, and `copy_jira_issue`.
 
 ### Utility
 
