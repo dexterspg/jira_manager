@@ -75,16 +75,12 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
 
     max_results = min(max_results, 100)
     try:
-        # Use the new /rest/api/3/search/jql endpoint with POST
-        url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
         payload = {
             "jql": jql,
             "maxResults": max_results,
             "fields": ["summary", "status", "priority", "assignee", "reporter", "updated", "issuetype", "project"],
         }
-        resp = requests.post(url, headers=_jira_headers(), json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _jira_post("search/jql", payload)
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
     except requests.RequestException as e:
@@ -131,7 +127,7 @@ def get_jira_issue(issue_key: str) -> str:
 
     try:
         data = _jira_get(f"issue/{issue_key}", params={
-            "fields": "summary,description,status,priority,assignee,reporter,created,updated,issuetype,project,labels,components,fixVersions,comment,resolution,resolutiondate,issuelinks,attachment",
+            "fields": "summary,description,status,priority,assignee,reporter,created,updated,issuetype,project,labels,components,fixVersions,versions,comment,resolution,resolutiondate,issuelinks,attachment,customfield_12000,customfield_13981",
         })
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
@@ -175,6 +171,22 @@ def get_jira_issue(issue_key: str) -> str:
     fix_versions = fields.get("fixVersions", [])
     if fix_versions:
         lines.append(f"**Fix Versions:** {', '.join(v.get('name', '') for v in fix_versions)}")
+
+    affect_versions = fields.get("versions", [])
+    if affect_versions:
+        lines.append(f"**Affect Versions:** {', '.join(v.get('name', '') for v in affect_versions)}")
+
+    customer_commitment = fields.get("customfield_13981")
+    if customer_commitment:
+        values = [item.get("value", "") for item in customer_commitment if isinstance(item, dict)]
+        if values:
+            lines.append(f"**Customer Commitment:** {', '.join(values)}")
+
+    # Resolution Path (customfield_12000)
+    resolution_path = fields.get("customfield_12000")
+    if resolution_path:
+        resolution_path_text = _adf_to_text(resolution_path) if isinstance(resolution_path, dict) else str(resolution_path)
+        lines.append(f"\n## Resolution Path\n{resolution_path_text}")
 
     lines.append(f"\n## Description\n{desc_text}")
 
@@ -273,6 +285,8 @@ def create_jira_issue(
     priority: str = "",
     assignee_id: str = "",
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
+    affect_versions: list[str] | None = None,
     custom_fields: dict | None = None,
 ) -> str:
     """Create a new Jira issue.
@@ -285,6 +299,8 @@ def create_jira_issue(
         priority: Priority name (e.g. 'High', 'Medium', 'Low'). Leave empty for project default
         assignee_id: Atlassian account ID of the assignee. Leave empty for unassigned
         labels: List of label strings to apply
+        fix_versions: List of version name strings (e.g. ['1.0', '1.1']). Leave as None to skip
+        affect_versions: List of version name strings (e.g. ['1.0']). Leave as None to skip
         custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Values are passed directly to the Jira API.
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
@@ -309,6 +325,10 @@ def create_jira_issue(
         fields["assignee"] = {"accountId": assignee_id}
     if labels:
         fields["labels"] = labels
+    if fix_versions is not None:
+        fields["fixVersions"] = [{"name": v} for v in fix_versions]
+    if affect_versions is not None:
+        fields["versions"] = [{"name": v} for v in affect_versions]
     if custom_fields:
         fields.update(custom_fields)
 
@@ -331,7 +351,10 @@ def update_jira_issue(
     status: str = "",
     priority: str = "",
     assignee_id: str = "",
+    reporter_id: str = "",
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
+    affect_versions: list[str] | None = None,
     comment: str = "",
     custom_fields: dict | None = None,
 ) -> str:
@@ -347,7 +370,10 @@ def update_jira_issue(
         status: Target status name to transition to (e.g. 'In Progress', 'Done'). Leave empty to keep current
         priority: New priority name (e.g. 'High', 'Medium', 'Low'). Leave empty to keep current
         assignee_id: Atlassian account ID. Leave empty to keep current
+        reporter_id: Atlassian account ID for the reporter. Leave empty to keep current
         labels: New list of labels (replaces all existing labels). Leave as None to keep current
+        fix_versions: List of version name strings (e.g. ['1.0', '1.1']). Replaces all existing fix versions. Leave as None to keep current
+        affect_versions: List of version name strings (e.g. ['1.0']). Replaces all existing affect versions. Leave as None to keep current
         comment: Add a comment to the issue. Leave empty to skip
         custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Values are passed directly to the Jira API.
     """
@@ -370,8 +396,14 @@ def update_jira_issue(
         fields["priority"] = {"name": priority}
     if assignee_id:
         fields["assignee"] = {"accountId": assignee_id}
+    if reporter_id:
+        fields["reporter"] = {"accountId": reporter_id}
     if labels is not None:
         fields["labels"] = labels
+    if fix_versions is not None:
+        fields["fixVersions"] = [{"name": v} for v in fix_versions]
+    if affect_versions is not None:
+        fields["versions"] = [{"name": v} for v in affect_versions]
     if custom_fields:
         fields.update(custom_fields)
 
@@ -522,6 +554,7 @@ def copy_jira_issue(
 
     # Attempt creation — if it fails due to invalid fields, strip them and retry
     max_retries = 3
+    data = None
     for attempt in range(max_retries):
         try:
             data = _jira_post("issue", {"fields": fields})
@@ -547,6 +580,9 @@ def copy_jira_issue(
         except requests.RequestException as e:
             return f"Connection error: {e}"
 
+    if data is None:
+        return f"Error: Failed to create copy of {source_issue_key} after {max_retries} retries"
+
     new_key = data.get("key", "")
     return f"Issue copied: **{source_issue_key}** → **{new_key}** — {JIRA_BASE_URL}/browse/{new_key}"
 
@@ -562,10 +598,7 @@ def get_custom_fields(search: str = "") -> str:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
 
     try:
-        url = f"{JIRA_BASE_URL}/rest/api/3/field"
-        resp = requests.get(url, headers=_jira_headers(), timeout=30)
-        resp.raise_for_status()
-        all_fields = resp.json()
+        all_fields = _jira_get("field")
     except requests.HTTPError as e:
         return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
     except requests.RequestException as e:

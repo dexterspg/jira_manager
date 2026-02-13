@@ -56,15 +56,32 @@ output/                       — Generated analyses and content
 ### Utility
 
 - **jql-query-builder** (yellow) — Complex JQL query construction and iterative search refinement
-- **jira-api-developer** (green) — Maintain and extend the MCP server
+- **jira-api-developer** (cyan) — Maintain and extend the MCP server (read-only — cannot create/update/copy tickets)
+
+## Access Control
+
+Only the **ticket-manager** agent may write to Jira. All other agents are read-only.
+
+| Agent | `get_jira_issue` | `search_jira_issues` | `create_jira_issue` | `update_jira_issue` | `copy_jira_issue` | `save_to_file` |
+|-------|:-:|:-:|:-:|:-:|:-:|:-:|
+| **content-creator** | R | | | | | W |
+| **ticket-analyzer** | R | R | | | | |
+| **jql-query-builder** | | R | | | | |
+| **jira-api-developer** | R | R | | | | W |
+| **ticket-manager** | R | R | W | W | W | |
+
+R = read, W = write. Empty = not permitted. Agents without permission MUST redirect users to **ticket-manager** for write operations.
 
 ## Analysis Format
 
-Every ticket analysis follows the 5-question format (template embedded in content-creator agent):
-1. What was the issue and its impact?
-2. What caused the issue?
-3. What troubleshooting steps should be taken?
-4. What resolution or workaround was applied?
-5. How can this be prevented in the future?
+Every ticket analysis and Resolution Path field (`customfield_12000`) **MUST** use exactly these 5 questions:
+
+1. **What was the issue and its impact?**
+2. **What caused the issue?**
+3. **What troubleshooting steps should be taken?**
+4. **What resolution or workaround was applied?**
+5. **How can this be prevented in the future?**
+
+Do NOT rephrase, reorder, or substitute these questions. Use them exactly as written above.
 
 Each question gets detailed, technical answers incorporating all relevant information from the ticket's description, resolution path, comments, and attached files.
