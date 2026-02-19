@@ -2,11 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(dir:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "mcp__jira__search_jira_issues",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(node search_zoetis.js:*)",
+      "Bash(echo:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "jira"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

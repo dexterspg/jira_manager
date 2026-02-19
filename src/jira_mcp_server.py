@@ -22,8 +22,9 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Initialize MCP server
-mcp = FastMCP("jira-ticket-analyzer")
+# Initialize MCP server — name must match the config key in ~/.claude/settings.json
+# so tools register consistently as mcp__jira__* in every session
+mcp = FastMCP("jira")
 
 
 def _jira_headers() -> dict:
@@ -86,13 +87,14 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
     except requests.RequestException as e:
         return f"Connection error: {e}"
 
-    total = data.get("total", 0)
     issues = data.get("issues", [])
+    is_last = data.get("isLast", True)
 
     if not issues:
         return f"No results found for JQL: {jql}"
 
-    lines = [f"Found {total} issue(s) (showing {len(issues)}):\n"]
+    count_label = f"{len(issues)} issue(s)" + ("" if is_last else "+")
+    lines = [f"Found {count_label}:\n"]
     for issue in issues:
         key = issue["key"]
         fields = issue["fields"]

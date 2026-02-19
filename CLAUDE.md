@@ -2,21 +2,42 @@
 
 ## Quick Start
 
-When the user says **"Analyze ticket PROJ-1234"** (or any variation like "look at", "review", "check"):
+When the user says **"Analyze ticket PROJ-1234"** (or any variation like "look at", "review", "check", "analyze"):
 
-1. Delegate directly to the **content-creator** agent — it fetches ticket data and produces the 5-question analysis in a single pass
+1. Delegate to the **ticket-analyzer** agent — it fetches ticket data and provides analysis and findings
+2. Display the analysis to the user
+
+When the user explicitly asks for **content output** (KB article, release notes, 5-question analysis, documentation):
+
+1. Delegate to the **content-creator** agent — it fetches ticket data and produces the requested content in a single pass
 2. The content-creator saves the result to `output/{TICKET-KEY}-analysis.md` using `save_to_file`
-3. Display the analysis to the user
-
-When the user asks for **general ticket info** (not a 5-question analysis):
-
-1. Delegate to the **ticket-analyzer** agent for raw ticket data and findings
+3. Display the content to the user
 
 When the user says **"Search for..."** or asks about tickets:
 
-1. Build a JQL query from their natural language request
-2. Call `search_jira_issues` with the JQL query
-3. Summarize the results
+**Prefer direct search (fast path)** — run the JQL via Bash calling `_jira_post` directly from `src/jira_mcp_server.py`. This avoids agent LLM roundtrips and MCP server startup overhead:
+
+```bash
+cd /c/workarea/jira_manager && python -c "
+from src.jira_mcp_server import _jira_post, JIRA_BASE_URL
+import json
+payload = {'jql': '<JQL_HERE>', 'maxResults': 20, 'fields': ['summary','status','priority','assignee','updated','issuetype','project']}
+data = _jira_post('search/jql', payload)
+issues = data.get('issues', [])
+is_last = data.get('isLast', True)
+for issue in issues:
+    f = issue['fields']
+    print(f\"{issue['key']} | {f.get('issuetype',{}).get('name','')} | {f.get('status',{}).get('name','')} | {f.get('priority',{}).get('name','') if f.get('priority') else 'None'} | {f.get('summary','')}\")
+print(f'--- {len(issues)} issues{\"\" if is_last else \" (more available)\"}  ---')
+" 2>/dev/null
+```
+
+Only delegate to the **jql-query-builder** agent when:
+- The user needs **iterative JQL refinement** (multiple rounds of query tweaking)
+- The query logic is **complex** (nested clauses, unfamiliar fields, JQL syntax help)
+- The user explicitly asks for the agent
+
+For straightforward searches (assignee + keyword, project + status, etc.), always use the direct path.
 
 When the user wants to **create, copy, update, or manage tickets**:
 
