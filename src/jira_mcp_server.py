@@ -79,7 +79,7 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
         payload = {
             "jql": jql,
             "maxResults": max_results,
-            "fields": ["summary", "status", "priority", "assignee", "reporter", "updated", "issuetype", "project"],
+            "fields": ["summary", "status", "priority", "assignee", "reporter", "created", "updated", "project", "fixVersions", "versions"],
         }
         data = _jira_post("search/jql", payload)
     except requests.HTTPError as e:
@@ -102,17 +102,27 @@ def search_jira_issues(jql: str, max_results: int = 20) -> str:
         status = fields.get("status", {}).get("name", "Unknown")
         priority_obj = fields.get("priority")
         priority = priority_obj.get("name", "None") if priority_obj else "None"
-        issue_type = fields.get("issuetype", {}).get("name", "")
         assignee = fields.get("assignee", {})
         assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
+        reporter = fields.get("reporter", {})
+        reporter_name = reporter.get("displayName", "Unknown") if reporter else "Unknown"
+        created = fields.get("created", "")[:10]
         updated = fields.get("updated", "")[:10]
-        project = fields.get("project", {}).get("key", "")
+        fix_versions = ", ".join(v.get("name", "") for v in fields.get("fixVersions", [])) or "N/A"
+        affect_versions = ", ".join(v.get("name", "") for v in fields.get("versions", [])) or "N/A"
         url = f"{JIRA_BASE_URL}/browse/{key}"
 
-        lines.append(f"- **{key}** ({issue_type} | {status} | {priority})")
-        lines.append(f"  {summary}")
-        lines.append(f"  Assignee: {assignee_name} | Updated: {updated}")
-        lines.append(f"  {url}\n")
+        lines.append(f"#: {issues.index(issue) + 1}")
+        lines.append(f"Key:            {url}")
+        lines.append(f"Status:         {status}")
+        lines.append(f"Priority:       {priority}")
+        lines.append(f"Reporter:       {reporter_name}")
+        lines.append(f"Assignee:       {assignee_name}")
+        lines.append(f"Fix Version:    {fix_versions}")
+        lines.append(f"Affect Version: {affect_versions}")
+        lines.append(f"Summary:        {summary}")
+        lines.append(f"Created:        {created}")
+        lines.append(f"Updated:        {updated}\n")
 
     return "\n".join(lines)
 
@@ -424,7 +434,8 @@ def update_jira_issue(
         try:
             transitions = _jira_get(f"issue/{issue_key}/transitions")
             match = next(
-                (t for t in transitions.get("transitions", []) if t["name"].lower() == status.lower()),
+                (t for t in transitions.get("transitions", [])
+                 if t["name"].lower() == status.lower() or t["to"]["name"].lower() == status.lower()),
                 None,
             )
             if match:
@@ -618,6 +629,158 @@ def get_custom_fields(search: str = "") -> str:
     lines = [f"Found {len(custom)} custom field(s):\n"]
     for f in custom:
         lines.append(f"- **{f.get('name', '')}** — `{f.get('id', '')}` (type: {f.get('schema', {}).get('type', 'unknown')})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def log_work_on_issue(
+    issue_key: str,
+    time_spent: str,
+    comment: str = "",
+    started: str = "",
+) -> str:
+    """Log work time on a Jira issue (equivalent to the 'Log work' button in the UI).
+
+    Args:
+        issue_key: The Jira issue key (e.g. 'LAE-123')
+        time_spent: Time spent in Jira duration format (e.g. '2h 30m', '1h', '30m', '1d')
+        comment: Optional work description/comment
+        started: Optional start datetime in ISO 8601 format (e.g. '2026-02-23T09:00:00.000+0000'). Defaults to now.
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
+    if not time_spent:
+        return "Error: time_spent is required (e.g. '2h 30m', '1h', '30m')"
+
+    payload: dict = {"timeSpent": time_spent}
+
+    if started:
+        payload["started"] = started
+    else:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        # Jira requires offset format (+0000), not Z
+        payload["started"] = now.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+    if comment:
+        payload["comment"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+        }
+
+    try:
+        data = _jira_post(f"issue/{issue_key}/worklog", payload)
+    except requests.HTTPError as e:
+        return f"Jira API error: {e.response.status_code} — {e.response.text[:500]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    worklog_id = data.get("id", "")
+    time_logged = data.get("timeSpent", time_spent)
+    author = data.get("author", {}).get("displayName", "")
+    started_out = data.get("started", "")[:16]
+
+    return (
+        f"Work logged on **{issue_key}** — {JIRA_BASE_URL}/browse/{issue_key}\n"
+        f"- Time spent: {time_logged}\n"
+        f"- Started: {started_out}\n"
+        f"- Author: {author}\n"
+        f"- Worklog ID: {worklog_id}"
+    )
+
+
+@mcp.tool()
+def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[str] | None = None, projects: list[str] | None = None) -> str:
+    """Get work logs for a date range, optionally filtered by assignee names and projects.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format (e.g., '2026-02-20')
+        end_date: End date in YYYY-MM-DD format (e.g., '2026-02-23')
+        assignee_names: Optional list of assignee names to filter by (e.g., ['Abdul Ghani', 'Samra Ejaz'])
+        projects: Optional list of project keys to search in (default: ['LAE', 'NCS'])
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
+
+    if projects is None:
+        projects = ["LAE", "NCS"]
+
+    try:
+        # Search for issues updated in the date range
+        payload = {
+            "jql": f"project in ({', '.join(projects)}) AND updated >= {start_date} AND updated <= {end_date} ORDER BY updated DESC",
+            "maxResults": 500,
+            "fields": ["key"]
+        }
+        search_data = _jira_post("search/jql", payload)
+        issues = search_data.get("issues", [])
+    except requests.HTTPError as e:
+        return f"Jira API error searching issues: {e.response.status_code} — {e.response.text[:500]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    if not issues:
+        return f"No issues found updated between {start_date} and {end_date}"
+
+    worklogs_by_person = {}
+    worklogs_by_date = {}
+
+    # Fetch worklogs for each issue
+    for issue in issues:
+        key = issue["key"]
+        try:
+            worklog_data = _jira_get(f"issue/{key}/worklog")
+            worklogs = worklog_data.get("worklogs", [])
+
+            for log in worklogs:
+                author = log.get("author", {}).get("displayName", "Unknown")
+                started = log.get("started", "")[:10]
+
+                # Filter by assignee names if provided
+                if assignee_names and not any(name.lower() in author.lower() for name in assignee_names):
+                    continue
+
+                time_spent = log.get("timeSpent", "0")
+
+                # Group by person
+                if author not in worklogs_by_person:
+                    worklogs_by_person[author] = []
+                worklogs_by_person[author].append({
+                    "ticket": key,
+                    "date": started,
+                    "time_spent": time_spent
+                })
+
+                # Group by date
+                if started not in worklogs_by_date:
+                    worklogs_by_date[started] = {}
+                if author not in worklogs_by_date[started]:
+                    worklogs_by_date[started][author] = []
+                worklogs_by_date[started][author].append({
+                    "ticket": key,
+                    "time_spent": time_spent
+                })
+        except requests.HTTPError:
+            pass  # Skip issues that fail
+        except requests.RequestException:
+            pass
+
+    if not worklogs_by_person:
+        return f"No work logs found for the specified criteria between {start_date} and {end_date}"
+
+    # Format output by date
+    lines = [f"# Work Logs: {start_date} to {end_date}\n"]
+
+    for date in sorted(worklogs_by_date.keys(), reverse=True):
+        lines.append(f"\n## {date}\n")
+        for person in sorted(worklogs_by_date[date].keys()):
+            logs = worklogs_by_date[date][person]
+            lines.append(f"\n**{person}**")
+            for log in logs:
+                lines.append(f"- {log['ticket']}: {log['time_spent']}")
 
     return "\n".join(lines)
 
