@@ -294,8 +294,10 @@ def create_jira_issue(
     summary: str,
     issue_type: str = "Task",
     description: str = "",
+    description_adf: dict | None = None,
     priority: str = "",
     assignee_id: str = "",
+    reporter_id: str = "",
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
     affect_versions: list[str] | None = None,
@@ -308,8 +310,10 @@ def create_jira_issue(
         summary: Issue summary/title
         issue_type: Issue type name (e.g. 'Task', 'Bug', 'Story'). Default 'Task'
         description: Plain text description (converted to Atlassian Document Format)
+        description_adf: Raw ADF dict for the description. Use this instead of description when you need mentions or rich formatting. If provided, description is ignored.
         priority: Priority name (e.g. 'High', 'Medium', 'Low'). Leave empty for project default
         assignee_id: Atlassian account ID of the assignee. Leave empty for unassigned
+        reporter_id: Atlassian account ID for the reporter. Leave empty for default
         labels: List of label strings to apply
         fix_versions: List of version name strings (e.g. ['1.0', '1.1']). Leave as None to skip
         affect_versions: List of version name strings (e.g. ['1.0']). Leave as None to skip
@@ -324,7 +328,9 @@ def create_jira_issue(
         "issuetype": {"name": issue_type},
     }
 
-    if description:
+    if description_adf:
+        fields["description"] = description_adf
+    elif description:
         fields["description"] = {
             "type": "doc",
             "version": 1,
@@ -335,6 +341,8 @@ def create_jira_issue(
         fields["priority"] = {"name": priority}
     if assignee_id:
         fields["assignee"] = {"accountId": assignee_id}
+    if reporter_id:
+        fields["reporter"] = {"accountId": reporter_id}
     if labels:
         fields["labels"] = labels
     if fix_versions is not None:
@@ -368,6 +376,7 @@ def update_jira_issue(
     fix_versions: list[str] | None = None,
     affect_versions: list[str] | None = None,
     comment: str = "",
+    comment_adf: dict | None = None,
     custom_fields: dict | None = None,
 ) -> str:
     """Update an existing Jira issue's fields.
@@ -386,7 +395,8 @@ def update_jira_issue(
         labels: New list of labels (replaces all existing labels). Leave as None to keep current
         fix_versions: List of version name strings (e.g. ['1.0', '1.1']). Replaces all existing fix versions. Leave as None to keep current
         affect_versions: List of version name strings (e.g. ['1.0']). Replaces all existing affect versions. Leave as None to keep current
-        comment: Add a comment to the issue. Leave empty to skip
+        comment: Add a plain text comment to the issue. Leave empty to skip
+        comment_adf: Add a comment using raw ADF dict (supports mentions). Use instead of comment when you need @mentions or rich formatting. If provided, comment is ignored.
         custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Values are passed directly to the Jira API.
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
@@ -450,15 +460,18 @@ def update_jira_issue(
             results.append(f"Connection error during transition: {e}")
 
     # Add comment if requested
-    if comment:
+    if comment_adf or comment:
         try:
-            comment_body = {
-                "body": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+            if comment_adf:
+                comment_body = {"body": comment_adf}
+            else:
+                comment_body = {
+                    "body": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+                    }
                 }
-            }
             _jira_post(f"issue/{issue_key}/comment", comment_body)
             results.append("Comment added")
         except requests.HTTPError as e:
@@ -693,7 +706,7 @@ def log_work_on_issue(
 
 
 @mcp.tool()
-def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[str] | None = None, projects: list[str] | None = None) -> str:
+def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[str] | None = None, projects: list[str] | None = None, filter_by: str = "worklog") -> str:
     """Get work logs for a date range, optionally filtered by assignee names and projects.
 
     Args:
@@ -701,6 +714,7 @@ def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[st
         end_date: End date in YYYY-MM-DD format (e.g., '2026-02-23')
         assignee_names: Optional list of assignee names to filter by (e.g., ['Abdul Ghani', 'Samra Ejaz'])
         projects: Optional list of project keys to search in (default: ['LAE', 'NCS'])
+        filter_by: How to find candidate issues — 'worklog' (default) finds issues with worklogs logged in the date range; 'updated' finds issues updated in the date range that also have worklogs in that range
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
@@ -708,10 +722,12 @@ def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[st
     if projects is None:
         projects = ["LAE", "NCS"]
 
+    date_field = "worklogDate" if filter_by == "worklog" else "updated"
+
     try:
-        # Search for issues updated in the date range
+        # Search for issues matching the date range
         payload = {
-            "jql": f"project in ({', '.join(projects)}) AND updated >= {start_date} AND updated <= {end_date} ORDER BY updated DESC",
+            "jql": f"project in ({', '.join(projects)}) AND {date_field} >= {start_date} AND {date_field} <= {end_date} ORDER BY updated DESC",
             "maxResults": 500,
             "fields": ["key"]
         }
@@ -738,6 +754,10 @@ def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[st
             for log in worklogs:
                 author = log.get("author", {}).get("displayName", "Unknown")
                 started = log.get("started", "")[:10]
+
+                # Filter by date range
+                if not (start_date <= started <= end_date):
+                    continue
 
                 # Filter by assignee names if provided
                 if assignee_names and not any(name.lower() in author.lower() for name in assignee_names):
