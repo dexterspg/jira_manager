@@ -1,6 +1,8 @@
 import logging
 import os
+import zipfile
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -247,6 +249,47 @@ def get_jira_issue(issue_key: str) -> str:
     return "\n".join(lines)
 
 
+def _strip_media_from_adf(node: dict | None) -> dict | None:
+    """Remove mediaSingle, mediaGroup, and media nodes from ADF.
+
+    Jira rejects descriptions with media nodes that reference files from another
+    issue. Call this before creating a copy of a ticket's description.
+    """
+    if not isinstance(node, dict):
+        return node
+    if node.get("type") in ("mediaSingle", "mediaGroup", "media"):
+        return None
+    content = node.get("content")
+    if content:
+        cleaned = [_strip_media_from_adf(c) for c in content if _strip_media_from_adf(c) is not None]
+        node = {**node, "content": cleaned}
+    return node
+
+
+def _resolve_version_ids(project_key: str, version_names: list[str]) -> list[dict]:
+    """Resolve version name strings to {id: ...} dicts for the Jira API.
+
+    Jira version names can have leading/trailing spaces in the system but not
+    in user input. This looks up the actual ID so name mismatches don't fail.
+    Falls back to {name: ...} if lookup fails.
+    """
+    try:
+        versions = _jira_get(f"project/{project_key}/versions")
+        name_to_id: dict[str, str] = {v["name"].strip(): v["id"] for v in versions}
+        result = []
+        for name in version_names:
+            stripped = name.strip()
+            if stripped in name_to_id:
+                result.append({"id": name_to_id[stripped]})
+            else:
+                # Partial match fallback
+                match = next((vid for vname, vid in name_to_id.items() if stripped in vname or vname in stripped), None)
+                result.append({"id": match} if match else {"name": name})
+        return result
+    except Exception:
+        return [{"name": v} for v in version_names]
+
+
 def _adf_to_text(node: dict | list | None) -> str:
     """Convert Atlassian Document Format (ADF) to plain text."""
     if node is None:
@@ -346,9 +389,9 @@ def create_jira_issue(
     if labels:
         fields["labels"] = labels
     if fix_versions is not None:
-        fields["fixVersions"] = [{"name": v} for v in fix_versions]
+        fields["fixVersions"] = _resolve_version_ids(project_key, fix_versions)
     if affect_versions is not None:
-        fields["versions"] = [{"name": v} for v in affect_versions]
+        fields["versions"] = _resolve_version_ids(project_key, affect_versions)
     if custom_fields:
         fields.update(custom_fields)
 
@@ -422,10 +465,13 @@ def update_jira_issue(
         fields["reporter"] = {"accountId": reporter_id}
     if labels is not None:
         fields["labels"] = labels
-    if fix_versions is not None:
-        fields["fixVersions"] = [{"name": v} for v in fix_versions]
-    if affect_versions is not None:
-        fields["versions"] = [{"name": v} for v in affect_versions]
+    if fix_versions is not None or affect_versions is not None:
+        issue_data = _jira_get(f"issue/{issue_key}", params={"fields": "project"})
+        update_project_key = issue_data.get("fields", {}).get("project", {}).get("key", "")
+        if fix_versions is not None:
+            fields["fixVersions"] = _resolve_version_ids(update_project_key, fix_versions)
+        if affect_versions is not None:
+            fields["versions"] = _resolve_version_ids(update_project_key, affect_versions)
     if custom_fields:
         fields.update(custom_fields)
 
@@ -489,24 +535,26 @@ def update_jira_issue(
 def copy_jira_issue(
     source_issue_key: str,
     target_project_key: str = "",
-    summary_override: str = "",
-    description_override: str = "",
-    issue_type_override: str = "",
+    summary: str = "",
+    description: str = "",
+    description_adf: dict | None = None,
+    issue_type: str = "",
     custom_fields: dict | None = None,
 ) -> str:
     """Copy (clone) an existing Jira issue into a new issue.
 
     Fetches the source issue and creates a new issue with the same fields.
-    Optionally override the target project, summary, description, or issue type.
-    Custom fields from the source are automatically carried over. Use custom_fields to override or add additional custom fields.
+    Media attachments embedded in the source description are automatically
+    stripped to avoid Jira validation errors (files can be re-attached after).
 
     Args:
         source_issue_key: The issue key to copy from (e.g. 'LAE-123')
         target_project_key: Target project key. Leave empty to use same project as source
-        summary_override: Override the summary. Leave empty to copy original (prefixed with '[Copy] ')
-        description_override: Override the description. Leave empty to copy original
-        issue_type_override: Override the issue type. Leave empty to copy original
-        custom_fields: Dictionary of custom field IDs to values (e.g. {"customfield_10100": "value"}). Overrides source custom fields if same key. Values are passed directly to the Jira API.
+        summary: Override the summary. Leave empty to copy original (prefixed with '[Copy] ')
+        description: Override description with plain text. Leave empty to copy original
+        description_adf: Override description with raw ADF dict (supports mentions). Takes priority over description if both provided.
+        issue_type: Override the issue type. Leave empty to copy original
+        custom_fields: Dictionary of custom field IDs to values. Overrides source custom fields if same key.
     """
     if not JIRA_BASE_URL or not JIRA_API_TOKEN:
         return "Error: Jira credentials not configured. Please set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env"
@@ -522,24 +570,29 @@ def copy_jira_issue(
     src_fields = source.get("fields", {})
 
     project_key = target_project_key or src_fields.get("project", {}).get("key", "")
-    summary = summary_override or f"[Copy] {src_fields.get('summary', '')}"
-    issue_type = issue_type_override or src_fields.get("issuetype", {}).get("name", "Task")
+    new_summary = summary or f"[Copy] {src_fields.get('summary', '')}"
+    new_issue_type = issue_type or src_fields.get("issuetype", {}).get("name", "Task")
 
     fields: dict = {
         "project": {"key": project_key},
-        "summary": summary,
-        "issuetype": {"name": issue_type},
+        "summary": new_summary,
+        "issuetype": {"name": new_issue_type},
     }
 
-    # Copy description (already in ADF) or use override
-    if description_override:
+    # Description: override takes priority, then copy source (stripping media nodes)
+    if description_adf:
+        fields["description"] = description_adf
+    elif description:
         fields["description"] = {
             "type": "doc",
             "version": 1,
-            "content": [{"type": "paragraph", "content": [{"type": "text", "text": description_override}]}],
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
         }
     elif src_fields.get("description"):
-        fields["description"] = src_fields["description"]
+        # Strip media nodes — Jira rejects media refs from other issues during creation
+        cleaned = _strip_media_from_adf(src_fields["description"])
+        if cleaned:
+            fields["description"] = cleaned
 
     priority = src_fields.get("priority")
     if priority:
@@ -553,9 +606,14 @@ def copy_jira_issue(
     if components:
         fields["components"] = [{"name": c.get("name", "")} for c in components]
 
+    # Use IDs (not names) for versions — names can have leading/trailing spaces in Jira
     fix_versions = src_fields.get("fixVersions", [])
     if fix_versions:
-        fields["fixVersions"] = [{"name": v.get("name", "")} for v in fix_versions]
+        fields["fixVersions"] = [{"id": v["id"]} for v in fix_versions if v.get("id")]
+
+    affect_versions = src_fields.get("versions", [])
+    if affect_versions:
+        fields["versions"] = [{"id": v["id"]} for v in affect_versions if v.get("id")]
 
     # Carry over custom fields from source (customfield_XXXXX)
     # Skip fields that are read-only or cause errors during creation
@@ -564,15 +622,15 @@ def copy_jira_issue(
         "customfield_10019",  # Rank (alternate ID in some Jira instances)
         "customfield_10016",  # Sprint (managed by board)
     }
-    for key, value in src_fields.items():
-        if not key.startswith("customfield_") or value is None:
+    for cf_key, value in src_fields.items():
+        if not cf_key.startswith("customfield_") or value is None:
             continue
-        if key in _SKIP_CUSTOM_FIELDS:
+        if cf_key in _SKIP_CUSTOM_FIELDS:
             continue
         # Skip complex objects that are likely read-only (e.g., requestType, SLA)
         if isinstance(value, dict) and "requestType" in str(value):
             continue
-        fields[key] = value
+        fields[cf_key] = value
 
     # Apply custom field overrides (these take priority over source values)
     if custom_fields:
@@ -803,6 +861,146 @@ def get_worklogs_by_date(start_date: str, end_date: str, assignee_names: list[st
                 lines.append(f"- {log['ticket']}: {log['time_spent']}")
 
     return "\n".join(lines)
+
+
+def _download_one_attachment(att: dict, target_dir: Path, extract_zips: bool) -> tuple[str, str | None]:
+    """Download a single attachment and optionally extract if it's a zip.
+
+    Returns (row_text, saved_path_or_None). Used by the parallel executor.
+    """
+    filename = att.get("filename", f"attachment-{att.get('id', '')}")
+    att_id = att.get("id")
+    target_path = target_dir / filename
+
+    try:
+        resp = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/attachment/content/{att_id}",
+            headers={"Authorization": _jira_headers()["Authorization"]},
+            allow_redirects=True,
+            stream=True,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        with open(target_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    f.write(chunk)
+    except requests.HTTPError as e:
+        return (f"  FAIL: {filename} — HTTP {e.response.status_code}", None)
+    except requests.RequestException as e:
+        return (f"  FAIL: {filename} — {e}", None)
+
+    size = target_path.stat().st_size
+    if size == 0:
+        return (f"  FAIL: {filename} — empty file (likely missing redirect follow)", None)
+    with open(target_path, "rb") as f:
+        head = f.read(200).lower()
+    if b"<!doctype html" in head or b"<html" in head:
+        return (f"  FAIL: {filename} — HTML response saved (auth/error page, {size} bytes)", None)
+
+    row = f"  OK: {filename} ({size:,} bytes) -> {target_path}"
+
+    if extract_zips and filename.lower().endswith(".zip"):
+        extract_dir = target_dir / target_path.stem
+        try:
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(target_path) as zf:
+                zf.extractall(extract_dir)
+            row += f"\n         extracted -> {extract_dir}"
+        except zipfile.BadZipFile:
+            row += f"\n         WARN: could not extract — not a valid zip"
+        except OSError as e:
+            row += f"\n         WARN: extract failed — {e}"
+
+    return (row, str(target_path))
+
+
+@mcp.tool()
+def download_jira_attachments(
+    issue_key: str,
+    output_dir: str,
+    filename_filter: str = "",
+    extract_zips: bool = True,
+    max_workers: int = 4,
+) -> str:
+    """Download attachments from a Jira issue to a local directory.
+
+    Centralizes the Jira attachment download protocol (REST API v3, follows
+    redirect to S3, verifies each file is non-empty and not an HTML error page).
+    Use this instead of curl + bash — auth, redirect handling, and verification
+    are handled here. Downloads run in parallel and zip files are auto-extracted.
+
+    Args:
+        issue_key: The Jira issue key (e.g. 'LAE-44173')
+        output_dir: Absolute directory path to save attachments to (created if missing)
+        filename_filter: Optional case-insensitive substring filter — only
+            attachments whose filename contains this substring are downloaded.
+            Empty = all attachments.
+        extract_zips: When True (default), .zip attachments are extracted into a
+            sibling directory named after the zip (without the .zip suffix).
+        max_workers: Parallel download workers (default 4). Set to 1 to force serial.
+
+    Returns: A multi-line summary of OK / FAILED / SKIPPED rows per attachment,
+    plus the absolute paths of successful downloads.
+    """
+    if not JIRA_BASE_URL or not JIRA_API_TOKEN:
+        return "Error: Jira credentials not configured."
+
+    target_dir = Path(output_dir)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"Error: cannot create output_dir {output_dir}: {e}"
+
+    try:
+        data = _jira_get(f"issue/{issue_key}", params={"fields": "attachment"})
+    except requests.HTTPError as e:
+        return f"Jira API error fetching {issue_key}: {e.response.status_code} — {e.response.text[:300]}"
+    except requests.RequestException as e:
+        return f"Connection error: {e}"
+
+    attachments = data.get("fields", {}).get("attachment", [])
+    if not attachments:
+        return f"No attachments on {issue_key}."
+
+    needle = filename_filter.lower() if filename_filter else ""
+    rows: list[str] = [f"Issue: {issue_key} — {len(attachments)} attachment(s) total"]
+    saved_paths: list[str] = []
+
+    # Partition into to-download vs filtered, preserving original order in output
+    to_download: list[tuple[int, dict]] = []
+    skip_rows: dict[int, str] = {}
+    for idx, att in enumerate(attachments):
+        filename = att.get("filename", f"attachment-{att.get('id', '')}")
+        if needle and needle not in filename.lower():
+            skip_rows[idx] = f"  SKIP: {filename} (filter mismatch)"
+        else:
+            to_download.append((idx, att))
+
+    results: dict[int, tuple[str, str | None]] = {}
+    if to_download:
+        workers = max(1, min(max_workers, len(to_download)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_download_one_attachment, att, target_dir, extract_zips): idx
+                for idx, att in to_download
+            }
+            for fut in futures:
+                idx = futures[fut]
+                results[idx] = fut.result()
+
+    for idx in range(len(attachments)):
+        if idx in skip_rows:
+            rows.append(skip_rows[idx])
+        else:
+            row, saved = results[idx]
+            rows.append(row)
+            if saved:
+                saved_paths.append(saved)
+
+    rows.append("")
+    rows.append(f"Saved {len(saved_paths)} file(s) to {target_dir}")
+    return "\n".join(rows)
 
 
 @mcp.tool()

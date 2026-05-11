@@ -60,6 +60,7 @@ print(f'--- {len(issues)} issues{\"\" if is_last else \" (more available)\"} ---
 | `get_custom_fields` | List custom field IDs by name |
 | `log_work_on_issue` | Log work time on a ticket |
 | `get_worklogs_by_date` | Get work logs for a date range |
+| `download_jira_attachments` | Download all (or filtered) attachments from a ticket — handles auth, S3 redirect, and per-file verification (rejects HTML-as-zip and 0-byte files) |
 | `save_to_file` | Save content to `output/` |
 
 ## Project Structure

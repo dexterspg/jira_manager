@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "python",
+      "args": [
+        "C:/workarea/jira_manager/src/jira_mcp_server.py"
+      ],
+      "cwd": "C:/workarea/jira_manager"
+    }
+  }
+}
